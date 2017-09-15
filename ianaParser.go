@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"golang.org/x/net/html"
@@ -17,6 +18,12 @@ var (
 	// The Root Zone Database represents the delegation details of top-level domains, including gTLDs such as .com, and country-code TLDs such as .uk. As the manager of the DNS root zone, we are responsible for coordinating these delegations in accordance with our policies and procedures.
 	URLRootZoneDb = "https://www.iana.org/domains/root/db"
 )
+
+var getBody *regexp.Regexp
+
+func init() {
+	getBody = regexp.MustCompile(`"(.*?)"`)
+}
 
 // RootZoneType - type of root zone
 type RootZoneType int
@@ -68,64 +75,84 @@ func GetRootZone() (rz RootZone, err error) {
 		dat = buffer.Bytes()
 	}
 
-	z := html.NewTokenizer(bytes.NewReader(dat))
-	insideTable := false
-	/*
-			Example of html part
-		    <tr>
-		        <td>
+	// create a channel for output
+	cBlock := make(chan [4]string)
 
-		            <span class="domain tld"><a href="/domains/root/db/aaa.html">.aaa</a></span></td>
+	go func() {
+		defer close(cBlock)
+		z := html.NewTokenizer(bytes.NewReader(dat))
+		insideTable := false
+		/* Example of html part
+		   <tr>
+		       <td>
 
-		        <td>generic</td>
-		        <td>American Automobile Association, Inc.</td>
-		    </tr>
-	*/
-	for {
-		tt := z.Next()
-		switch tt {
-		case html.ErrorToken:
-			goto END
-		case html.TextToken:
-			/*
-				short := strings.TrimSpace(string(z.Text()))
-				if len(short) < 1 {
-					continue
-				}
-				if short == "\n" {
-					continue
-				}*/
-			if insideTable {
-				fmt.Printf("text --> !%s!\n\n", z.Text())
-			}
-		case html.StartTagToken, html.EndTagToken:
-			tag, hasAttr := z.TagName()
-			if atom.Lookup(tag) == atom.Table {
-				if insideTable {
-					insideTable = false
-					continue
-				} else {
-					insideTable = true
-					r := z.Raw()
-					if !strings.Contains(string(r), "iana-table") {
-						insideTable = false
+		           <span class="domain tld"><a href="/domains/root/db/aaa.html">.aaa</a></span></td>
+
+		       <td>generic</td>
+		       <td>American Automobile Association, Inc.</td>
+		   </tr>
+		*/
+		insideRow := false
+		counter := 0
+		var block [4]string
+		for {
+			tt := z.Next()
+			switch tt {
+			case html.ErrorToken:
+				return
+			case html.TextToken:
+				if insideTable && insideRow {
+					short := strings.TrimSpace(string(z.Text()))
+					if len(short) > 0 && short != "\n" {
+						block[counter] = short
+						counter++
 					}
 				}
-			}
-			if insideTable {
-				fmt.Printf("tag1 --> tag %s\n", tag)
-				fmt.Printf("tag2 --> hasAttr %v\n", hasAttr)
-				c, d, e := z.TagAttr()
-				fmt.Printf("tag4 --> c %s\n", c)
-				fmt.Printf("tag5 --> d %s\n", d)
-				fmt.Printf("tag6 --> e %v\n", e)
-				g := z.Text()
-				fmt.Printf("tag7 --> g %v\n", g)
-				r := z.Raw()
-				fmt.Printf("tag8 --> raw %s\n", r)
+			case html.StartTagToken, html.EndTagToken:
+				tag, _ := z.TagName()
+				if atom.Lookup(tag) == atom.Table {
+					if insideTable {
+						insideTable = false
+						continue
+					} else {
+						insideTable = true
+						if !strings.Contains(string(z.Raw()), "iana-table") {
+							insideTable = false
+						}
+					}
+				}
+				if insideTable && atom.Lookup(tag) == atom.Tr {
+					if insideRow {
+						cBlock <- block
+						counter = 0
+						insideRow = false
+					} else {
+						insideRow = true
+					}
+				}
+
+				if insideTable && insideRow {
+					s := strings.TrimSpace(string(z.Raw()))
+					if strings.Contains(s, "href") {
+						//r := regexp.MustCompile(`"(.*?)"`)
+						result := getBody.FindAllString(s, -1)
+						// result : "/domains/root/db/xn--mgbayh7gpa.html"
+						block[counter] = result[0][1 : len(result[0])-1]
+						counter++
+					}
+				}
+
 			}
 		}
+	}()
+
+	for c := range cBlock {
+		for i := 0; i < 4; i++ {
+			for j := 0; j < i; j++ {
+				fmt.Printf("\t")
+			}
+			fmt.Println(c[i])
+		}
 	}
-END:
 	return rz, nil
 }
