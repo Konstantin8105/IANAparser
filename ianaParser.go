@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"regexp"
 	"strings"
@@ -17,6 +16,9 @@ var (
 	// URLRootZoneDb - url of web page
 	// The Root Zone Database represents the delegation details of top-level domains, including gTLDs such as .com, and country-code TLDs such as .uk. As the manager of the DNS root zone, we are responsible for coordinating these delegations in accordance with our policies and procedures.
 	URLRootZoneDb = "https://www.iana.org/domains/root/db"
+
+	// URLIana - main url of IANA website
+	URLIana = "https://www.iana.org"
 )
 
 var getBody *regexp.Regexp
@@ -25,73 +27,57 @@ func init() {
 	getBody = regexp.MustCompile(`"(.*?)"`)
 }
 
-// RootZoneType - type of root zone
-type RootZoneType int
-
-// Type of root zone
-const (
-	Generic RootZoneType = iota
-	CountryCode
-	Sponsored
-)
-
 // RootZone - type of root zone
 type RootZone struct {
 	Domain                 string
 	Type                   RootZoneType
 	SponsoringOrganisation string
+	URLorganization        string
 }
 
-// GetRootZone - get root zone database
-func GetRootZone() (rz RootZone, err error) {
-	dat, err := ioutil.ReadFile("page")
+// GetRootZone - get root zone database from website and parsing
+func GetRootZone() (rz []RootZone, err error) {
+	response, err := http.Get(URLRootZoneDb)
 	if err != nil {
-
-		response, err := http.Get(URLRootZoneDb)
-		if err != nil {
-			return rz, err
-		}
-
-		defer func() {
-			err2 := response.Body.Close()
-			if err2 != nil {
-				if err != nil {
-					err = fmt.Errorf("Errors: %v\n%v", err, err2)
-				} else {
-					err = err2
-				}
-			}
-		}()
-		var buffer bytes.Buffer
-		_, err = io.Copy(&buffer, response.Body)
-		if err != nil {
-			return rz, err
-		}
-
-		err = ioutil.WriteFile("page", buffer.Bytes(), 0666)
-		if err != nil {
-			panic(err)
-		}
-		dat = buffer.Bytes()
+		return rz, err
 	}
+
+	defer func() {
+		err2 := response.Body.Close()
+		if err2 != nil {
+			if err != nil {
+				err = fmt.Errorf("Errors: %v\n%v", err, err2)
+			} else {
+				err = err2
+			}
+		}
+	}()
+
+	var buffer bytes.Buffer
+	_, err = io.Copy(&buffer, response.Body)
+	if err != nil {
+		return rz, err
+	}
+	dat := buffer.Bytes()
 
 	// create a channel for output
 	cBlock := make(chan [4]string)
 
+	/* Example of html part
+	   <tr>
+	       <td><span class="domain tld"><a href="/domains/root/db/aaa.html">.aaa</a></span></td>
+	       <td>generic</td>
+	       <td>American Automobile Association, Inc.</td>
+	   </tr>
+	*/
 	go func() {
+		// close the channel
 		defer close(cBlock)
+
+		// analyze html page
 		z := html.NewTokenizer(bytes.NewReader(dat))
 		insideTable := false
-		/* Example of html part
-		   <tr>
-		       <td>
-
-		           <span class="domain tld"><a href="/domains/root/db/aaa.html">.aaa</a></span></td>
-
-		       <td>generic</td>
-		       <td>American Automobile Association, Inc.</td>
-		   </tr>
-		*/
+		insideTableBody := false
 		insideRow := false
 		counter := 0
 		var block [4]string
@@ -101,7 +87,7 @@ func GetRootZone() (rz RootZone, err error) {
 			case html.ErrorToken:
 				return
 			case html.TextToken:
-				if insideTable && insideRow {
+				if insideTable && insideTableBody && insideRow {
 					short := strings.TrimSpace(string(z.Text()))
 					if len(short) > 0 && short != "\n" {
 						block[counter] = short
@@ -121,7 +107,14 @@ func GetRootZone() (rz RootZone, err error) {
 						}
 					}
 				}
-				if insideTable && atom.Lookup(tag) == atom.Tr {
+				if insideTable && atom.Lookup(tag) == atom.Tbody {
+					if insideTableBody {
+						insideTableBody = false
+					} else {
+						insideTableBody = true
+					}
+				}
+				if insideTable && insideTableBody && atom.Lookup(tag) == atom.Tr {
 					if insideRow {
 						cBlock <- block
 						counter = 0
@@ -131,10 +124,9 @@ func GetRootZone() (rz RootZone, err error) {
 					}
 				}
 
-				if insideTable && insideRow {
+				if insideTable && insideTableBody && insideRow {
 					s := strings.TrimSpace(string(z.Raw()))
 					if strings.Contains(s, "href") {
-						//r := regexp.MustCompile(`"(.*?)"`)
 						result := getBody.FindAllString(s, -1)
 						// result : "/domains/root/db/xn--mgbayh7gpa.html"
 						block[counter] = result[0][1 : len(result[0])-1]
@@ -147,12 +139,16 @@ func GetRootZone() (rz RootZone, err error) {
 	}()
 
 	for c := range cBlock {
-		for i := 0; i < 4; i++ {
-			for j := 0; j < i; j++ {
-				fmt.Printf("\t")
-			}
-			fmt.Println(c[i])
+		tz, err := convertToRootZoneType(c[2])
+		if err != nil {
+			return rz, err
 		}
+		rz = append(rz, RootZone{
+			Domain: c[1],
+			Type:   tz,
+			SponsoringOrganisation: c[3],
+			URLorganization:        URLIana + c[0],
+		})
 	}
 	return rz, nil
 }
